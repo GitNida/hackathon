@@ -1,0 +1,11 @@
+def display_message():
+    """
+    Function to display the success message.
+    Returns:
+        str: The success message "wow! we have done it :)"
+    """
+    return "wow! we have done it :)"
+
+if __name__ == "__main__":
+    # Display the message to the console
+    print(display_message())
