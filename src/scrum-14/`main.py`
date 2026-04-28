@@ -1,0 +1,17 @@
+def display_message():
+    """
+    Function to display the success message.
+    Returns:
+        str: The success message.
+    """
+    return "wow! we have done it :)"
+
+def main():
+    """
+    Main function to execute the program.
+    """
+    message = display_message()
+    print(message)
+
+if __name__ == "__main__":
+    main()
