@@ -1,0 +1,15 @@
+def display_message():
+    """
+    Function to display the message "wow! we have done it :)".
+
+    Returns:
+        str: The message to be displayed.
+    """
+    message = "wow! we have done it :)"
+    print(message)
+    return message
+
+
+if __name__ == "__main__":
+    # Main execution to display the message
+    display_message()
