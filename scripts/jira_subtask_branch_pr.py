@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Fetch Jira subtasks for a parent issue, create one branch per subtask, add a small
-scaffold (spec + implementation stub) from the Jira description, push, and open a
-GitHub pull request.
+Fetch Jira subtasks for a parent issue, create one branch per subtask, write
+Cursor-ready context files, ask Cursor Agent to implement the work, push, and
+open a GitHub pull request.
 
 Prerequisites:
   - Jira Cloud API token: https://id.atlassian.com/manage-profile/security/api-tokens
   - GitHub fine-grained or classic token with `repo` for PRs
+  - Cursor Agent CLI on PATH (default command: `agent`)
   - `git` on PATH; repo `origin` set (e.g. https://github.com/GitNida/hackathon)
   - Base branch exists locally and on remote (e.g. `main` with at least one commit)
 
@@ -17,6 +18,7 @@ Environment (or a `.env` file in repo root):
   GITHUB_TOKEN    GitHub PAT with repo scope
   (optional) GITHUB_OWNER  default: parsed from `git remote get-url origin`
   (optional) GITHUB_REPO   default: parsed from origin
+  (optional) CURSOR_AGENT_COMMAND  default: agent
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ import argparse
 import base64
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +38,7 @@ import requests
 from dotenv import load_dotenv
 
 JIRA_API = "/rest/api/3"
+ISSUE_FIELDS = "summary,description,issuetype,status,parent,subtasks"
 
 
 def eprint(*args: Any) -> None:
@@ -58,6 +63,21 @@ def run_git_or_none(args: list[str], cwd: Path) -> str | None:
     if r.returncode != 0:
         return None
     return (r.stdout or "").strip() or None
+
+
+def git_has_staged_changes(cwd: Path) -> bool:
+    r = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode == 0:
+        return False
+    if r.returncode == 1:
+        return True
+    raise RuntimeError(f"git diff --cached --quiet failed: {r.stderr or r.stdout}")
 
 
 def repo_root() -> Path:
@@ -134,6 +154,20 @@ def issue_description_text(fields: dict) -> str:
     return str(desc).strip()
 
 
+def nested_name(fields: dict, key: str) -> str:
+    value = fields.get(key) or {}
+    if isinstance(value, dict):
+        return str(value.get("name") or "")
+    return ""
+
+
+def parent_key(fields: dict) -> str:
+    parent = fields.get("parent") or {}
+    if isinstance(parent, dict):
+        return str(parent.get("key") or "")
+    return ""
+
+
 def subtask_list(parent_json: dict) -> list[dict[str, str]]:
     """Return [{key, summary}, ...] from parent issue JSON."""
     subs = parent_json.get("fields", {}).get("subtasks", []) or []
@@ -192,23 +226,138 @@ def github_request(
     return {}
 
 
-def write_task_scaffold(
-    base: Path, issue_key: str, summary: str, body_text: str, jira_base: str
-) -> None:
+def write_task_context(
+    base: Path,
+    *,
+    issue_key: str,
+    summary: str,
+    body_text: str,
+    jira_base: str,
+    story_key: str,
+    issue_type: str,
+    status: str,
+    parent: str,
+) -> tuple[Path, Path]:
     d = base / "tasks" / issue_key
     d.mkdir(parents=True, exist_ok=True)
-    spec = d / "SPEC.txt"
     jira_url = f"{jira_base.rstrip('/')}/browse/{issue_key}"
-    spec.write_text(
-        f"Issue: {issue_key}\nJira: {jira_url}\n\nSummary:\n{summary}\n\nDescription:\n{body_text or '(none)'}\n",
+    story_url = f"{jira_base.rstrip('/')}/browse/{story_key}" if story_key else ""
+    context = d / "CONTEXT.md"
+    prompt = d / "CURSOR_PROMPT.md"
+
+    context.write_text(
+        "\n".join(
+            [
+                f"# {issue_key}: {summary}",
+                "",
+                "## Jira",
+                "",
+                f"- Issue: [{issue_key}]({jira_url})",
+                f"- Story: [{story_key}]({story_url})" if story_key else "- Story: (none)",
+                f"- Parent: {parent or '(none)'}",
+                f"- Type: {issue_type or '(unknown)'}",
+                f"- Status: {status or '(unknown)'}",
+                "",
+                "## Summary",
+                "",
+                summary or "(none)",
+                "",
+                "## Description",
+                "",
+                body_text or "(none)",
+                "",
+                "## Implementation Expectations",
+                "",
+                "- Inspect the repository before making changes.",
+                "- Implement the Jira subtask with the smallest coherent change.",
+                "- Add or update focused tests when the change affects behavior.",
+                "- Do not commit, push, open PRs, or modify secrets such as `.env` files.",
+                "- Keep generated context files in `tasks/` available for review.",
+                "",
+            ]
+        ),
         encoding="utf-8",
     )
-    impl = d / "implementation.py"
-    if not impl.exists():
-        impl.write_text(
-            f'"""\nImplement SCRUM work for {issue_key} — see tasks/{issue_key}/SPEC.txt\n"""\n\n# TODO: implement per Jira description\n\ndef run() -> None:\n    raise NotImplementedError("{issue_key}")\n',
-            encoding="utf-8",
-        )
+
+    prompt.write_text(
+        "\n".join(
+            [
+                f"Implement Jira subtask {issue_key}: {summary}",
+                "",
+                f"Use the context file at `tasks/{issue_key}/CONTEXT.md` as the source of truth.",
+                "Read the relevant repository files, then make the code changes needed for this task.",
+                "",
+                "Constraints:",
+                "- Do not commit, push, or create a pull request; this script handles git and GitHub.",
+                "- Do not read, print, edit, or stage `.env` files or credential files.",
+                "- Keep the change scoped to the Jira task.",
+                "- Add or update tests when appropriate for the implementation.",
+                "- If the Jira description is insufficient, make the smallest reasonable implementation and document assumptions in the task context or code comments only when useful.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return context, prompt
+
+
+def command_parts(command: str) -> list[str]:
+    command = command.strip()
+    if not command:
+        return []
+    return shlex.split(command)
+
+
+def cursor_command_available(command: str) -> bool:
+    parts = command_parts(command)
+    if not parts:
+        return False
+    exe = parts[0]
+    return Path(exe).exists() or shutil.which(exe) is not None
+
+
+def resolve_command(parts: list[str]) -> list[str]:
+    if not parts:
+        return parts
+    exe = parts[0]
+    if Path(exe).exists():
+        return parts
+    resolved = shutil.which(exe)
+    if resolved:
+        return [resolved, *parts[1:]]
+    return parts
+
+
+def run_cursor_agent(
+    *,
+    cwd: Path,
+    cursor_command: str,
+    cursor_extra_args: list[str],
+    prompt_path: Path,
+) -> None:
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    parts = resolve_command(command_parts(cursor_command))
+    if not parts:
+        raise RuntimeError("Cursor Agent command is empty")
+    cmd = [
+        *parts,
+        "-p",
+        "--force",
+        "--output-format",
+        "json",
+        "--workspace",
+        str(cwd),
+        *cursor_extra_args,
+        prompt_text,
+    ]
+    eprint(f"Running Cursor Agent for {prompt_path.parent.name}...")
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+    if r.stdout:
+        eprint(r.stdout.strip())
+    if r.stderr:
+        eprint(r.stderr.strip())
+    if r.returncode != 0:
+        raise RuntimeError(f"Cursor Agent failed ({r.returncode})")
 
 
 def process_one_issue(
@@ -221,15 +370,24 @@ def process_one_issue(
     owner: str,
     repo: str,
     github_token: str,
+    story_key: str,
+    summary_hint: str,
     dry_run: bool,
     skip_pr: bool,
+    context_only: bool,
+    cursor_command: str,
+    cursor_extra_args: list[str],
 ) -> str | None:
-    """Create branch, commit scaffold, push, return PR URL or None."""
+    """Create branch, run Cursor from Jira context, push, return PR URL or None."""
     if dry_run:
-        b = f"feature/{branch_slug(issue_key, 'summary-from-jira')}"
+        b = f"feature/{branch_slug(issue_key, summary_hint or 'summary-from-jira')}"
         eprint(f"Would use branch: {b}")
-        eprint(f"Would add tasks/{issue_key}/ (SPEC + implementation.py)")
-        eprint("Would push to origin and open a GitHub PR (unless --skip-pr)")
+        eprint(f"Would add tasks/{issue_key}/CONTEXT.md and CURSOR_PROMPT.md")
+        if context_only:
+            eprint("Would skip Cursor Agent (--context-only)")
+        else:
+            eprint(f"Would run Cursor Agent via: {cursor_command}")
+        eprint("Would commit, push to origin, and open a GitHub PR (unless --skip-pr)")
         return None
 
     if s is None:
@@ -239,18 +397,22 @@ def process_one_issue(
         s,
         jira_base,
         f"{JIRA_API}/issue/{issue_key}",
-        params={"fields": "summary,description,issuetype,status,subtasks"},
+        params={"fields": ISSUE_FIELDS},
     )
     fields = data.get("fields") or {}
     summary = (fields.get("summary") or issue_key).strip()
     body_text = issue_description_text(fields)
+    issue_type = nested_name(fields, "issuetype")
+    status = nested_name(fields, "status")
+    parent = parent_key(fields)
 
     branch = f"feature/{branch_slug(issue_key, summary)}"
     pr_title = f"[{issue_key}] {summary}"
     jira_browse = f"{jira_base.rstrip('/')}/browse/{issue_key}"
     pr_body = (
-        f"Automated PR from Jira subtask.\n\n"
+        f"Automated PR from Jira subtask context.\n\n"
         f"- **Jira:** [{issue_key}]({jira_browse})\n"
+        f"- **Context:** `tasks/{issue_key}/CONTEXT.md`\n"
     )
 
     if run_git_or_none(["rev-parse", f"refs/heads/{base_branch}"], cwd) is None:
@@ -268,24 +430,43 @@ def process_one_issue(
     run_git(["checkout", base_branch], cwd)
     run_git(["pull", "origin", base_branch], cwd)
 
+    current_branch = run_git_or_none(["branch", "--show-current"], cwd)
     if run_git_or_none(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd):
-        eprint(
-            f"Branch {branch} already exists. Delete it or use a new issue. Skipping."
+        if current_branch != branch:
+            run_git(["checkout", branch], cwd)
+        eprint(f"Branch {branch} already exists. Continuing on that branch.")
+    else:
+        run_git(["checkout", "-b", branch], cwd)
+    _, prompt_path = write_task_context(
+        cwd,
+        issue_key=issue_key,
+        summary=summary,
+        body_text=body_text,
+        jira_base=jira_base,
+        story_key=story_key,
+        issue_type=issue_type,
+        status=status,
+        parent=parent,
+    )
+    if context_only:
+        eprint(f"Wrote Cursor context for {issue_key}; skipping Cursor Agent.")
+    else:
+        run_cursor_agent(
+            cwd=cwd,
+            cursor_command=cursor_command,
+            cursor_extra_args=cursor_extra_args,
+            prompt_path=prompt_path,
         )
-        return None
 
-    run_git(["checkout", "-b", branch], cwd)
-    write_task_scaffold(cwd, issue_key, summary, body_text, jira_base)
-    run_git(["add", f"tasks/{issue_key}"], cwd)
-    status = run_git(["status", "--porcelain"], cwd)
-    if not status:
-        eprint("Nothing to commit; skipping")
+    run_git(["add", "--all", "--", ".", ":!*.env", ":!**/.env", ":!*.pem", ":!*.key"], cwd)
+    if not git_has_staged_changes(cwd):
+        eprint("No staged changes after context/Cursor step; skipping commit.")
         return None
     run_git(
         [
             "commit",
             "-m",
-            f"{issue_key} scaffold from Jira: {summary}"[:200],
+            f"{issue_key} implement from Jira: {summary}"[:200],
         ],
         cwd
     )
@@ -313,7 +494,7 @@ def process_one_issue(
 
 def main() -> int:
     load_dotenv()
-    p = argparse.ArgumentParser(description="Jira subtasks -> git branch -> GitHub PR")
+    p = argparse.ArgumentParser(description="Jira subtasks -> Cursor Agent -> GitHub PR")
     p.add_argument(
         "--parent",
         default="SCRUM-10",
@@ -333,7 +514,23 @@ def main() -> int:
         "--dry-run", action="store_true", help="Print actions without git/GitHub."
     )
     p.add_argument(
+        "--context-only",
+        action="store_true",
+        help="Write Cursor context and prompt files, but do not invoke Cursor Agent.",
+    )
+    p.add_argument(
         "--skip-pr", action="store_true", help="Push branch but do not open a PR."
+    )
+    p.add_argument(
+        "--cursor-command",
+        default=os.environ.get("CURSOR_AGENT_COMMAND", "agent"),
+        help="Cursor Agent CLI command to run (default: agent).",
+    )
+    p.add_argument(
+        "--cursor-extra-arg",
+        action="append",
+        default=[],
+        help="Extra argument to pass to Cursor Agent. Repeat for multiple args.",
     )
     p.add_argument(
         "--max",
@@ -353,23 +550,33 @@ def main() -> int:
             ("JIRA_BASE_URL", jira_base),
             ("JIRA_EMAIL", email),
             ("JIRA_API_TOKEN", jira_token),
-            ("GITHUB_TOKEN", gh),
         ]:
             if not val:
                 eprint(f"Missing {name} in environment or .env")
                 return 1
+        if not args.skip_pr and not gh:
+            eprint("Missing GITHUB_TOKEN in environment or .env")
+            return 1
+        if not args.context_only and not cursor_command_available(args.cursor_command):
+            eprint(
+                f"Cursor Agent command not found: {args.cursor_command}. "
+                "Install the Cursor Agent CLI, set CURSOR_AGENT_COMMAND, "
+                "or use --context-only."
+            )
+            return 1
 
     cwd = repo_root()
     owner, repo_name = parse_github_remote(cwd)
     owner = os.environ.get("GITHUB_OWNER", owner)
     repo_name = os.environ.get("GITHUB_REPO", repo_name)
-    if not args.dry_run and (not owner or not repo_name):
+    if not args.dry_run and not args.skip_pr and (not owner or not repo_name):
         eprint("Could not parse GITHUB_OWNER/GITHUB_REPO from `git remote origin`")
         return 1
 
     base_branch = args.base or default_base_branch(cwd)
 
-    s = jira_session(jira_base, email, jira_token) if not args.dry_run else None
+    has_jira_credentials = bool(jira_base and email and jira_token)
+    s = jira_session(jira_base, email, jira_token) if has_jira_credentials else None
 
     issue_keys: list[dict[str, str]] = []
     if args.parent_only:
@@ -407,12 +614,6 @@ def main() -> int:
     if args.max and len(issue_keys) > args.max:
         issue_keys = issue_keys[: args.max]
 
-    if args.dry_run and not args.parent_only:
-        eprint(
-            f"[dry-run] Would list subtasks of {args.parent} and for each: branch, tasks/<KEY>/, push, PR"
-        )
-        return 0
-
     urls: list[str] = []
     for i, item in enumerate(issue_keys):
         key = item["key"]
@@ -426,8 +627,13 @@ def main() -> int:
             owner=owner,
             repo=repo_name,
             github_token=gh,
+            story_key=args.parent if not args.parent_only else "",
+            summary_hint=item.get("summary", ""),
             dry_run=bool(args.dry_run),
             skip_pr=bool(args.skip_pr),
+            context_only=bool(args.context_only),
+            cursor_command=args.cursor_command,
+            cursor_extra_args=args.cursor_extra_arg,
         )
         if u:
             urls.append(u)
